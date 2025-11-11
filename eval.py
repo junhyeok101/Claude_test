@@ -26,7 +26,7 @@ import logging
 import wandb
 import platform
 
-#테스트/ 검증 데이터셋에 대한 평가 수행 함수 
+#테스트/ 검증 데이터셋에 대한 평가 수행 함수
 def test(args, wandb_log):
     if not args.identity:
         model = STHN(args)
@@ -56,23 +56,24 @@ def test(args, wandb_log):
     else:
         model = None
 
+    # DataLoader 대신 Dataset 직접 사용
     if args.test:
-        val_dataset = datasets.fetch_dataloader(args, split='test')
+        val_dataset = datasets.MYDATA(args, args.datasets_folder, args.dataset_name, split='test')
     else:
-        val_dataset = datasets.fetch_dataloader(args, split='val')
+        val_dataset = datasets.MYDATA(args, args.datasets_folder, args.dataset_name, split='val')
 
-    evaluate_SNet(model, val_dataset, batch_size=args.batch_size, args=args, wandb_log=wandb_log)
+    evaluate_SNet(model, val_dataset, args=args, wandb_log=wandb_log)
 
 
 
-def evaluate_SNet(model, val_dataset, batch_size=0, args=None, wandb_log=False):
+def evaluate_SNet(model, val_dataset, args=None, wandb_log=False):
     """
     모델 평가를 수행하는 핵심 함수
-    - 배치별로 forward pass 수행
+    - 샘플별로 query-database 쌍을 생성하고 forward pass 수행
     - MACE, CE 등의 메트릭 계산
     - 매칭 결과 시각화 및 저장
     """
-    assert batch_size > 0, "batchsize > 0"
+    # batch_size 체크 제거 - 이제 개별 샘플 처리
 
     # 변수 정리 
     # 메트릭 누적용 텐서 초기화
@@ -112,38 +113,49 @@ def evaluate_SNet(model, val_dataset, batch_size=0, args=None, wandb_log=False):
     # ==================== 
 
     if args.generate_test_pairs:
-        test_pairs = torch.zeros(len(val_dataset.dataset), dtype=torch.long)
+        test_pairs = torch.zeros(len(val_dataset), dtype=torch.long)
 
     # GPU 메모리 캐시 정리
     torch.cuda.empty_cache()
 
-    # 배치별 평가 루프
-    for i_batch, data_blob in enumerate(tqdm(val_dataset)):
+    # 개별 샘플별 평가 루프 (query-database 쌍을 하나씩 생성하고 처리)
+    for i in tqdm(range(len(val_dataset))):
         # 샘플 개수 기준으로 조기 종료 (MAX_EVAL_SAMPLES가 None이 아닐 때만)
         if MAX_EVAL_SAMPLES is not None and processed_samples >= MAX_EVAL_SAMPLES:
             break
 
-        # 데이터 언팩
-        img1, img2, flow_gt, H, query_utm, database_utm, index, pos_index = [x for x in data_blob]
-        current_batch_size = img1.shape[0]  # 현재 배치의 실제 샘플 수
+        # 데이터 로드 (이 시점에 query-database 쌍이 생성됨)
+        img2, img1, flow_gt, H, query_utm, database_utm, index, pos_index = val_dataset[i]
+
+        # 배치 차원 추가 (모델이 배치 입력을 기대하므로)
+        img1 = img1.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
+        img2 = img2.unsqueeze(0)
+        flow_gt = flow_gt.unsqueeze(0)
+        H = H.unsqueeze(0)
+        query_utm = query_utm.unsqueeze(0)
+        database_utm = database_utm.unsqueeze(0)
+        index = torch.tensor([index])
+        pos_index = torch.tensor([pos_index])
+
+        current_batch_size = 1  # 항상 1개씩 처리
 
         if args.generate_test_pairs:
             test_pairs[index] = pos_index
 
-        # 첫 번째 배치에서 재현성 확인용 로그 출력
+        # 첫 번째 샘플에서 재현성 확인용 로그 출력
         """
-        if i_batch == 0:
+        if i == 0:
             logging.info("Check the reproducibility by UTM:")
-            logging.info(f"the first 5th query UTMs: {query_utm[:5]}")
-            logging.info(f"the first 5th database UTMs: {database_utm[:5]}")
+            logging.info(f"the first query UTM: {query_utm}")
+            logging.info(f"the first database UTM: {database_utm}")
         """
 
-        # 1000 배치마다 입력 이미지 저장
-        if i_batch % 1000 == 0:
+        # 1000 샘플마다 입력 이미지 저장
+        if i % 1000 == 0:
             save_img(torchvision.utils.make_grid((img1)),
-                     args.save_dir + "/b1_epoch_" + str(i_batch).zfill(5) + "_finaleval_" + '.png')
+                     args.save_dir + "/b1_epoch_" + str(i).zfill(5) + "_finaleval_" + '.png')
             save_img(torchvision.utils.make_grid((img2)),
-                     args.save_dir + "/b2_epoch_" + str(i_batch).zfill(5) + "_finaleval_" + '.png')
+                     args.save_dir + "/b2_epoch_" + str(i).zfill(5) + "_finaleval_" + '.png')
             torch.cuda.empty_cache()
 
         if not args.identity:
@@ -160,10 +172,10 @@ def evaluate_SNet(model, val_dataset, batch_size=0, args=None, wandb_log=False):
             else:
                 four_pred = torch.zeros((flow_gt.shape[0], 2, 2, 2))
 
-            # ==================== 🔍 첫 배치 디버깅 ====================
-            if i_batch == 0:
+            # ==================== 🔍 첫 샘플 디버깅 ====================
+            if i == 0:
                 print("\n" + "="*80)
-                print("🚨 FIRST BATCH DIAGNOSIS")
+                print("🚨 FIRST SAMPLE DIAGNOSIS")
                 print("="*80)
                 
                 # Ground Truth 4개의 코너의 flow 추출 (여기서 먼저 계산)
@@ -215,23 +227,24 @@ def evaluate_SNet(model, val_dataset, batch_size=0, args=None, wandb_log=False):
                     print("\n⚠️  WARNING: All predictions are ZERO!")
                 
                 print("="*80 + "\n")
-            # ==================== 첫 배치 디버깅 종료 ====================
+            # ==================== 첫 샘플 디버깅 종료 ====================
 
-# ==================== 배치 내 각 샘플별 시각화 ====================
+# ==================== 각 샘플별 시각화 ====================
             if not args.identity:
-                for b_idx in range(current_batch_size):
-                    # 실제 데이터셋 인덱스 가져오기
-                    actual_index = index[b_idx].item()
-                    
-                    # 시각화 범위 체크
-                    if actual_index < VIS_START_INDEX:
-                        continue
-                    if VIS_END_INDEX is not None and actual_index >= VIS_END_INDEX:
-                        continue
-                    
-                    # 텐서를 numpy로 변환
-                    q_img = img1[b_idx].permute(1, 2, 0).cpu().numpy()
-                    d_img = img2[b_idx].permute(1, 2, 0).cpu().numpy()
+                # 실제 데이터셋 인덱스 가져오기
+                actual_index = index.item()
+
+                # 시각화 범위 체크
+                should_visualize = True
+                if actual_index < VIS_START_INDEX:
+                    should_visualize = False
+                if VIS_END_INDEX is not None and actual_index >= VIS_END_INDEX:
+                    should_visualize = False
+
+                if should_visualize:
+                    # 텐서를 numpy로 변환 (배치 차원 제거)
+                    q_img = img1[0].permute(1, 2, 0).cpu().numpy()
+                    d_img = img2[0].permute(1, 2, 0).cpu().numpy()
                     # [0,1] 범위 → [0,255] 범위로 변환
                     q_img = (q_img * 255).astype(np.uint8)
                     d_img = (d_img * 255).astype(np.uint8)
@@ -256,8 +269,8 @@ def evaluate_SNet(model, val_dataset, batch_size=0, args=None, wandb_log=False):
                     # 호모그래피 계산을 위한 점 집합 생성
                     # src: 원본 4개 코너
                     src_pts = four_point_org_single.flatten(2).permute(0, 2, 1)[0].numpy().astype(np.float32)
-                    # dst: 예측된 오프셋을 더한 4개 코너
-                    dst_pts_pred  = (four_pred[b_idx].cpu().detach().unsqueeze(0) + four_point_org_single) \
+                    # dst: 예측된 오프셋을 더한 4개 코너 (배치 차원 제거: [0])
+                    dst_pts_pred  = (four_pred[0].cpu().detach().unsqueeze(0) + four_point_org_single) \
                                 .flatten(2).permute(0, 2, 1)[0].numpy().astype(np.float32)
 
                     # 4점 호모그래피 행렬 계산 및 워핑
@@ -267,14 +280,14 @@ def evaluate_SNet(model, val_dataset, batch_size=0, args=None, wandb_log=False):
                     ## 알파 블렌딩으로 겹친 이미지 생성
                     alpha_blend = 0.5
                     overlay_small = cv2.addWeighted(q_small, 1 - alpha_blend, warped_pred, alpha_blend, 0)
-                    
+
                     # ========== GT 호모그래피 계산 (초록색으로 표시) ==========
-                    # GT flow에서 4개 코너 추출
+                    # GT flow에서 4개 코너 추출 (배치 차원 제거: [0])
                     flow_4cor_single = torch.zeros((1, 2, 2, 2))
-                    flow_4cor_single[:, :, 0, 0] = flow_gt[b_idx, :, 0, 0]      # 좌상단
-                    flow_4cor_single[:, :, 0, 1] = flow_gt[b_idx, :, 0, -1]     # 우상단
-                    flow_4cor_single[:, :, 1, 0] = flow_gt[b_idx, :, -1, 0]     # 좌하단 
-                    flow_4cor_single[:, :, 1, 1] = flow_gt[b_idx, :, -1, -1]    # 우하단
+                    flow_4cor_single[:, :, 0, 0] = flow_gt[0, :, 0, 0]      # 좌상단
+                    flow_4cor_single[:, :, 0, 1] = flow_gt[0, :, 0, -1]     # 우상단
+                    flow_4cor_single[:, :, 1, 0] = flow_gt[0, :, -1, 0]     # 좌하단
+                    flow_4cor_single[:, :, 1, 1] = flow_gt[0, :, -1, -1]    # 우하단
                     
                     dst_pts_gt = (flow_4cor_single + four_point_org_single) \
                                 .flatten(2).permute(0, 2, 1)[0].numpy().astype(np.float32)
@@ -312,9 +325,9 @@ def evaluate_SNet(model, val_dataset, batch_size=0, args=None, wandb_log=False):
                     os.makedirs(save_dir, exist_ok=True)
                     save_path = os.path.join(save_dir, f"match_{actual_index:05d}.png")
                     cv2.imwrite(save_path, cv2.cvtColor(vis3, cv2.COLOR_RGB2BGR))
-                    
+
                     saved_vis_count += 1
-# ==================== 배치 내 각 샘플별 시각화 ====================
+# ==================== 각 샘플별 시각화 종료 ====================
 
 
             # ==================== 메트릭 계산 ====================
@@ -412,22 +425,22 @@ def evaluate_SNet(model, val_dataset, batch_size=0, args=None, wandb_log=False):
             recall_threshold_25 = 25.0  # 25 미터
             correct_in_batch_25 = torch.sum(ce_meters <= recall_threshold_25).item()
             correct_predictions_25 += correct_in_batch_25
-            total_predictions_25 += len(ce_vec)
+            total_predictions_25 += 1  # 샘플 1개씩 처리
 
             recall_threshold_10 = 10.0  # 10 미터
             correct_in_batch_10 = torch.sum(ce_meters <= recall_threshold_10).item()
             correct_predictions_10 += correct_in_batch_10
-            total_predictions_10 += len(ce_vec)
+            total_predictions_10 += 1  # 샘플 1개씩 처리
 
             recall_threshold_1 = 1.0  # 1 미터
             correct_in_batch_1 = torch.sum(ce_meters <= recall_threshold_1).item()
             correct_predictions_1 += correct_in_batch_1
-            total_predictions_1 += len(ce_vec)
+            total_predictions_1 += 1  # 샘플 1개씩 처리
 
             # ==================== Recall  계산 종료 ====================
-        
+
         # 처리된 샘플 수 업데이트
-        processed_samples += current_batch_size
+        processed_samples += 1  # 샘플 1개씩 처리
     
                 
     # 루프 종료 후 Recall 최종 계산
